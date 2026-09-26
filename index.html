@@ -301,6 +301,33 @@
   </div>
 </div>
 
+<div id="tx-modal" class="modal-overlay" style="display:none;" onclick="if(event.target===this) closeTxModal()">
+  <div class="modal-panel glass">
+    <div class="modal-head">
+      <div>
+        <div class="modal-name" id="txm-nom">—</div>
+        <div class="modal-sub" id="txm-info" style="color:var(--text-dim);font-size:13px;margin-top:4px;"></div>
+      </div>
+      <div class="modal-close" onclick="closeTxModal()">✕</div>
+    </div>
+    <div id="txm-edit-form" style="display:none;">
+      <label>Client</label>
+      <input class="input-field" id="txm-client" placeholder="Nom du client">
+      <label>Montant (FCFA)</label>
+      <input class="input-field" id="txm-montant" type="number" inputmode="numeric">
+      <label>Numéro (optionnel)</label>
+      <input class="input-field" id="txm-telephone" type="tel">
+      <button class="submit" onclick="saveTxEdit()">Enregistrer les modifications</button>
+      <button class="submit" style="background:#FFFFFF;color:var(--text);border:1px solid var(--glass-border);box-shadow:none;margin-top:8px;" onclick="cancelEditTx()">Annuler</button>
+    </div>
+    <div id="txm-actions" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:16px;">
+      <div class="btn-action" onclick="viewTxReceipt()">🧾 Fiche</div>
+      <div class="btn-action" onclick="startEditTx()">✎ Modifier</div>
+      <div class="btn-action" onclick="deleteTxConfirm()" style="color:var(--danger);">🗑 Supprimer</div>
+    </div>
+  </div>
+</div>
+
 <script>
 /* ---------- Connexion Supabase ---------- */
 const SUPABASE_URL = "https://rtncjdbtkztjqqieqegx.supabase.co";
@@ -644,11 +671,114 @@ function showReceipt(id){
   const entry = receiptLookup[id];
   if (entry) openReceipt(entry.tx, entry.clientNom);
 }
+
+/* ---------- Modifier / supprimer une transaction ---------- */
+let currentTxId = null;
+function openTxModal(id){
+  const entry = receiptLookup[id];
+  if (!entry) return;
+  currentTxId = id;
+  const tx = entry.tx;
+  const d = new Date(tx.created_at);
+  document.getElementById('txm-nom').textContent = entry.clientNom;
+  document.getElementById('txm-info').textContent = typeLabel(tx.type)+' · '+Number(tx.montant).toLocaleString('fr-FR')+' FCFA · '+d.toLocaleDateString('fr-FR')+' '+d.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
+  document.getElementById('txm-edit-form').style.display = 'none';
+  document.getElementById('txm-actions').style.display = 'grid';
+  document.getElementById('tx-modal').style.display = 'flex';
+}
+function closeTxModal(){ document.getElementById('tx-modal').style.display = 'none'; currentTxId = null; }
+function viewTxReceipt(){
+  const entry = receiptLookup[currentTxId];
+  if (entry) openReceipt(entry.tx, entry.clientNom);
+}
+function startEditTx(){
+  const entry = receiptLookup[currentTxId];
+  if (!entry) return;
+  document.getElementById('txm-client').value = entry.clientNom;
+  document.getElementById('txm-montant').value = entry.tx.montant;
+  document.getElementById('txm-telephone').value = entry.tx.telephone || '';
+  document.getElementById('txm-edit-form').style.display = 'block';
+  document.getElementById('txm-actions').style.display = 'none';
+}
+function cancelEditTx(){
+  document.getElementById('txm-edit-form').style.display = 'none';
+  document.getElementById('txm-actions').style.display = 'grid';
+}
+async function saveTxEdit(){
+  const entry = receiptLookup[currentTxId];
+  if (!entry) return;
+  const tx = entry.tx;
+  const newNom = document.getElementById('txm-client').value.trim();
+  const newMontant = parseFloat(document.getElementById('txm-montant').value);
+  const newTelephone = document.getElementById('txm-telephone').value.trim();
+  if (!newNom || !newMontant || newMontant <= 0){ alert('Remplis le nom et un montant valide'); return; }
+
+  // 1) annule l'effet de l'ancienne opération (cumul client + solde)
+  const allClients = await idbGetAll('clients');
+  const oldClient = allClients.find(c=>c.id===tx.client_id);
+  if (oldClient){
+    const cumulApres = Math.max(0, (Number(oldClient.cumul_transactions)||0) - Number(tx.montant));
+    const updatedOld = { ...oldClient, cumul_transactions: cumulApres, categorie: computeCategorie(cumulApres) };
+    await idbPut('clients', updatedOld);
+    await queueMutation('clients','upsert', updatedOld, 'id');
+  }
+  const oldDelta = tx.type === 'retrait' ? tx.montant : -tx.montant;
+  await updateSolde('airtel', -oldDelta);
+
+  // 2) applique la nouvelle version (client éventuellement renommé)
+  const newClient = await upsertClient(newNom);
+  const cumulApres2 = (Number(newClient.cumul_transactions)||0) + newMontant;
+  const updatedNew = { ...newClient, cumul_transactions: cumulApres2, categorie: computeCategorie(cumulApres2) };
+  await idbPut('clients', updatedNew);
+  await queueMutation('clients','upsert', updatedNew, 'id');
+  const newDelta = tx.type === 'retrait' ? newMontant : -newMontant;
+  await updateSolde('airtel', newDelta);
+
+  // 3) met à jour la transaction elle-même
+  const updatedTx = { ...tx, client_id: newClient.id, montant: newMontant, telephone: newTelephone };
+  await idbPut('transactions', updatedTx);
+  await queueMutation('transactions','upsert', updatedTx, 'id');
+  receiptLookup[currentTxId] = { tx: updatedTx, clientNom: newNom };
+
+  if (isOnline()) flushQueue();
+  closeTxModal();
+  await loadDashboard();
+  await loadHistorique();
+  await loadClients();
+}
+async function deleteTxConfirm(){
+  const entry = receiptLookup[currentTxId];
+  if (!entry) return;
+  const tx = entry.tx;
+  const ok = confirm('Supprimer cette transaction de '+Number(tx.montant).toLocaleString('fr-FR')+' FCFA pour '+entry.clientNom+' ?\n\nCette action est irréversible.');
+  if (!ok) return;
+
+  const allClients = await idbGetAll('clients');
+  const client = allClients.find(c=>c.id===tx.client_id);
+  if (client){
+    const cumulApres = Math.max(0, (Number(client.cumul_transactions)||0) - Number(tx.montant));
+    const updated = { ...client, cumul_transactions: cumulApres, categorie: computeCategorie(cumulApres) };
+    await idbPut('clients', updated);
+    await queueMutation('clients','upsert', updated, 'id');
+  }
+  const delta = tx.type === 'retrait' ? tx.montant : -tx.montant;
+  await updateSolde('airtel', -delta);
+
+  await idbDelete('transactions', tx.id);
+  await queueMutation('transactions','delete', null, { id: tx.id });
+  delete receiptLookup[tx.id];
+
+  if (isOnline()) flushQueue();
+  closeTxModal();
+  await loadDashboard();
+  await loadHistorique();
+  await loadClients();
+}
 function renderHistorique(list){
   document.getElementById('hi-list').innerHTML = list.length ? list.map(t=>{
     const d = new Date(t.created_at);
     const when = d.toLocaleDateString('fr-FR',{day:'numeric',month:'short'})+' · '+d.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
-    return `<div class="row" onclick="showReceipt('${t.id}')" style="cursor:pointer;"><div><div class="row-name">${t.clients?.nom||'Client'}</div><div class="row-sub">${typeLabel(t.type)} · ${when}</div></div>
+    return `<div class="row" onclick="openTxModal('${t.id}')" style="cursor:pointer;"><div><div class="row-name">${t.clients?.nom||'Client'}</div><div class="row-sub">${typeLabel(t.type)} · ${when}</div></div>
       <div class="row-amount">${Number(t.montant).toLocaleString('fr-FR')} FCFA</div></div>`;
   }).join('') : '<div class="row"><div class="row-name">Aucune transaction</div></div>';
 }
@@ -749,7 +879,7 @@ async function openClient(id){
     const times = groups[k].map(t=>{
       const heure = new Date(t.created_at).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
       const label = t.type==='depot'?'Dépôt':t.type==='retrait'?'Retrait':t.type==='credit_appel'?'Crédit appel':'Crédit internet';
-      return `<div class="day-time-row" onclick="showReceipt('${t.id}')" style="cursor:pointer;"><span>${heure} — ${label}</span><span>${Number(t.montant).toLocaleString('fr-FR')} FCFA</span></div>`;
+      return `<div class="day-time-row" onclick="openTxModal('${t.id}')" style="cursor:pointer;"><span>${heure} — ${label}</span><span>${Number(t.montant).toLocaleString('fr-FR')} FCFA</span></div>`;
     }).join('');
     return `<div class="day-group">
       <div class="day-head" onclick="this.nextElementSibling.classList.toggle('open')">
