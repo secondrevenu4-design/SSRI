@@ -141,7 +141,10 @@
   <div class="view active" data-view="accueil">
     <div class="topbar">
       <div class="brand">SS<span>RI</span></div>
-      <div class="date" id="today"></div>
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span class="date" id="sync-status" style="display:none;background:rgba(176,18,26,.10);color:var(--amber);border-color:rgba(176,18,26,.3);"></span>
+        <div class="date" id="today"></div>
+      </div>
     </div>
     <div class="hero glass" onclick="setObjectif()" style="cursor:pointer;">
       <div class="hero-label">Ventes du jour · toucher pour fixer l'objectif</div>
@@ -236,6 +239,10 @@
     <label>Taux de commission (%)</label>
     <input class="input-field" id="pr-commission" type="number" inputmode="decimal" placeholder="0">
     <button class="submit" onclick="saveParametres()">Enregistrer les réglages</button>
+
+    <div class="section-title">Synchronisation</div>
+    <button class="submit" style="background:linear-gradient(135deg,#8C0F16,var(--cyan));" onclick="syncNow()">↻ Synchroniser maintenant</button>
+    <div class="row-sub" id="sync-info" style="margin-top:8px;text-align:center;"></div>
   </div>
 
   <!-- HISTORIQUE -->
@@ -285,7 +292,125 @@
 /* ---------- Connexion Supabase ---------- */
 const SUPABASE_URL = "https://rtncjdbtkztjqqieqegx.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ0bmNqZGJ0a3p0anFxaWVxZWd4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAzMjIxMjcsImV4cCI6MjEwNTg5ODEyN30.4U0c41HaZORLlXVNoQyf-ciwD5dQKlRzni7yHt_prYk";
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const sb = (typeof supabase !== 'undefined') ? supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+
+/* ---------- Stockage local (IndexedDB) : l'app fonctionne toujours sur ces données ---------- */
+const STORES = { clients:'id', transactions:'id', dettes:'id', approvisionnements:'id', objectifs:'date', soldes:'operateur', parametres:'id' };
+let dbPromise = null;
+function openDB(){
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject)=>{
+    const req = indexedDB.open('ssri_local', 1);
+    req.onupgradeneeded = ()=>{
+      const db = req.result;
+      Object.entries(STORES).forEach(([name, keyPath])=>{
+        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath });
+      });
+      if (!db.objectStoreNames.contains('sync_queue')) db.createObjectStore('sync_queue', { keyPath:'qid', autoIncrement:true });
+    };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+  return dbPromise;
+}
+async function idbGetAll(store){
+  const db = await openDB();
+  return new Promise((resolve,reject)=>{
+    const req = db.transaction(store,'readonly').objectStore(store).getAll();
+    req.onsuccess = ()=>resolve(req.result || []);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function idbGet(store, key){
+  const db = await openDB();
+  return new Promise((resolve,reject)=>{
+    const req = db.transaction(store,'readonly').objectStore(store).get(key);
+    req.onsuccess = ()=>resolve(req.result || null);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function idbPut(store, value){
+  const db = await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(store,'readwrite');
+    tx.objectStore(store).put(value);
+    tx.oncomplete = ()=>resolve(value);
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function idbDelete(store, key){
+  const db = await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(store,'readwrite');
+    tx.objectStore(store).delete(key);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+
+/* ---------- File d'attente de synchro : chaque écriture hors-ligne y est notée ---------- */
+function isOnline(){ return navigator.onLine; }
+async function queueMutation(table, op, payload, matchKey){
+  await idbPut('sync_queue', { table, op, payload, matchKey, created_at: new Date().toISOString() });
+  updateSyncBadge();
+}
+async function flushQueue(){
+  if (!isOnline() || !sb) return;
+  const items = (await idbGetAll('sync_queue')).sort((a,b)=>a.qid-b.qid);
+  for (const item of items){
+    try{
+      if (item.op === 'insert' || item.op === 'upsert'){
+        await sb.from(item.table).upsert(item.payload, { onConflict: typeof item.matchKey === 'string' ? item.matchKey : 'id' });
+      } else if (item.op === 'update'){
+        await sb.from(item.table).update(item.payload).match(item.matchKey);
+      } else if (item.op === 'delete'){
+        await sb.from(item.table).delete().match(item.matchKey);
+      }
+      await idbDelete('sync_queue', item.qid);
+    } catch(e){
+      console.warn('En attente de connexion pour synchroniser', item.table, e);
+      break; // on garde l'ordre : on réessaiera à la prochaine connexion
+    }
+  }
+  updateSyncBadge();
+}
+async function pullAll(){
+  if (!isOnline() || !sb) return;
+  for (const t of Object.keys(STORES)){
+    try{
+      const { data, error } = await sb.from(t).select('*');
+      if (error || !data) continue;
+      const db = await openDB();
+      const tx = db.transaction(t,'readwrite');
+      const os = tx.objectStore(t);
+      data.forEach(row=>os.put(row));
+      await new Promise((res,rej)=>{ tx.oncomplete=res; tx.onerror=()=>rej(tx.error); });
+    } catch(e){ /* pas grave, on retentera plus tard */ }
+  }
+}
+async function syncNow(){
+  const info = document.getElementById('sync-info');
+  if (!isOnline()){ if (info) info.textContent = 'Hors ligne — synchro impossible pour le moment.'; return; }
+  if (info) info.textContent = 'Synchronisation en cours…';
+  await flushQueue();
+  await pullAll();
+  await loadParametres();
+  await loadDashboard();
+  await loadClients();
+  if (document.querySelector('.view[data-view="historique"]')?.classList.contains('active')) await loadHistorique();
+  if (info) info.textContent = 'Synchronisé le ' + new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
+  updateSyncBadge();
+}
+async function updateSyncBadge(){
+  const count = (await idbGetAll('sync_queue')).length;
+  const el = document.getElementById('sync-status');
+  if (!el) return;
+  if (!isOnline()){ el.textContent = count ? ('Hors ligne · '+count+' en attente') : 'Hors ligne'; el.style.display='inline-flex'; }
+  else if (count){ el.textContent = 'Synchro… ('+count+')'; el.style.display='inline-flex'; }
+  else { el.style.display = 'none'; }
+}
+window.addEventListener('online', ()=>{ updateSyncBadge(); syncNow(); });
+window.addEventListener('offline', updateSyncBadge);
 
 const citations = [
   "Chaque petite vente d'aujourd'hui construit l'objectif de demain.",
@@ -322,10 +447,10 @@ async function setObjectif(){
 }
 
 /* ---------- Paramètres (seuil solde bas, commission) ---------- */
-let parametresCache = { seuil_solde_bas: 20000, taux_commission: 0 };
+let parametresCache = { id:'default', seuil_solde_bas: 20000, taux_commission: 0 };
 async function loadParametres(){
-  const { data } = await sb.from('parametres').select('*').eq('id','default').maybeSingle();
-  if (data) parametresCache = data;
+  const local = await idbGet('parametres','default');
+  if (local) parametresCache = local;
   return parametresCache;
 }
 function loadParametresIntoForm(){
@@ -335,17 +460,22 @@ function loadParametresIntoForm(){
 async function saveParametres(){
   const seuil = parseFloat(document.getElementById('pr-seuil').value) || 0;
   const commission = parseFloat(document.getElementById('pr-commission').value) || 0;
-  await sb.from('parametres').upsert({ id:'default', seuil_solde_bas: seuil, taux_commission: commission, updated_at: new Date().toISOString() });
-  parametresCache = { id:'default', seuil_solde_bas: seuil, taux_commission: commission };
-  alert('Réglages enregistrés');
+  const row = { id:'default', seuil_solde_bas: seuil, taux_commission: commission, updated_at: new Date().toISOString() };
+  await idbPut('parametres', row);
+  await queueMutation('parametres','upsert', row, 'id');
+  parametresCache = row;
+  if (isOnline()) flushQueue();
+  alert('Réglages enregistrés' + (isOnline() ? '' : ' (seront synchronisés au retour de la connexion)'));
   await loadDashboard();
 }
 
 /* ---------- Solde ---------- */
 async function updateSolde(operateur, delta){
-  const { data } = await sb.from('soldes').select('*').eq('operateur', operateur).maybeSingle();
-  const nouveau = (data?.solde || 0) + delta;
-  await sb.from('soldes').upsert({ operateur, solde: nouveau, updated_at: new Date().toISOString() });
+  const current = await idbGet('soldes', operateur);
+  const nouveau = (current?.solde || 0) + delta;
+  const row = { operateur, solde: nouveau, updated_at: new Date().toISOString() };
+  await idbPut('soldes', row);
+  await queueMutation('soldes','upsert', row, 'operateur');
   return nouveau;
 }
 
@@ -354,12 +484,15 @@ async function loadDashboard(){
   document.getElementById('today').textContent = new Date().toLocaleDateString('fr-FR',{weekday:'short',day:'numeric',month:'short'});
   document.getElementById('quote').textContent = citations[Math.floor(Math.random()*citations.length)];
   await loadParametres();
+  updateSyncBadge();
 
-  const { data: obj } = await sb.from('objectifs').select('montant_jour').eq('date', todayStr()).maybeSingle();
+  const obj = await idbGet('objectifs', todayStr());
   const objectifJour = obj?.montant_jour || 0;
 
-  const { data: txsJour } = await sb.from('transactions').select('montant, type, created_at').gte('created_at', todayStr()+"T00:00:00");
-  const venteJour = (txsJour||[]).filter(t=>t.type.startsWith('credit')).reduce((s,t)=>s+Number(t.montant),0);
+  const allTx = await idbGetAll('transactions');
+  const debutJour = todayStr()+"T00:00:00";
+  const txsJour = allTx.filter(t => t.created_at >= debutJour);
+  const venteJour = txsJour.filter(t=>t.type.startsWith('credit')).reduce((s,t)=>s+Number(t.montant),0);
 
   const pct = objectifJour ? Math.min(100, Math.round((venteJour/objectifJour)*100)) : 0;
   document.getElementById('hero-amount').innerHTML = venteJour.toLocaleString('fr-FR')+' <small>/ '+objectifJour.toLocaleString('fr-FR')+' FCFA</small>';
@@ -368,15 +501,16 @@ async function loadDashboard(){
 
   document.getElementById('commission-jour').textContent = Math.round(venteJour*(parametresCache.taux_commission||0)/100).toLocaleString('fr-FR')+' FCFA';
 
-  const { data: solde } = await sb.from('soldes').select('solde').eq('operateur','airtel').maybeSingle();
+  const solde = await idbGet('soldes', 'airtel');
   const soldeVal = solde?.solde||0;
   document.getElementById('solde-airtel').textContent = soldeVal.toLocaleString('fr-FR')+' FCFA';
   document.getElementById('solde-tag').style.display = soldeVal < (parametresCache.seuil_solde_bas||0) ? 'inline-flex' : 'none';
 
-  const { data: dernierAppro } = await sb.from('approvisionnements').select('created_at').order('created_at',{ascending:false}).limit(1);
+  const allAppro = await idbGetAll('approvisionnements');
   const reapproTag = document.getElementById('reappro-tag');
-  if (dernierAppro && dernierAppro.length){
-    const jours = Math.floor((Date.now() - new Date(dernierAppro[0].created_at))/86400000);
+  if (allAppro.length){
+    const dernier = [...allAppro].sort((a,b)=> new Date(b.created_at)-new Date(a.created_at))[0];
+    const jours = Math.floor((Date.now() - new Date(dernier.created_at))/86400000);
     document.getElementById('reappro-status').textContent = jours===0 ? "Aujourd'hui" : 'Il y a '+jours+' jour(s)';
     document.getElementById('ra-dernier').textContent = jours===0 ? "Aujourd'hui" : 'Il y a '+jours+' jour(s)';
     if (jours >= 2){ reapproTag.textContent='à approvisionner'; reapproTag.className='tag warn'; }
@@ -387,13 +521,12 @@ async function loadDashboard(){
   }
 
   const debutSemaine = startOfWeek();
-  const { data: txsSemaine } = await sb.from('transactions').select('montant, type').gte('created_at', debutSemaine);
-  const ventesSemaine = (txsSemaine||[]).filter(t=>t.type.startsWith('credit')).reduce((s,t)=>s+Number(t.montant),0);
+  const txsSemaine = allTx.filter(t => t.created_at >= debutSemaine);
+  const ventesSemaine = txsSemaine.filter(t=>t.type.startsWith('credit')).reduce((s,t)=>s+Number(t.montant),0);
   document.getElementById('week-ventes').textContent = ventesSemaine.toLocaleString('fr-FR')+' FCFA';
   document.getElementById('commission-semaine').textContent = Math.round(ventesSemaine*(parametresCache.taux_commission||0)/100).toLocaleString('fr-FR')+' FCFA';
 
-  const { data: approSemaine } = await sb.from('approvisionnements').select('montant').gte('created_at', debutSemaine);
-  const reapproSemaine = (approSemaine||[]).reduce((s,a)=>s+Number(a.montant),0);
+  const reapproSemaine = allAppro.filter(a=>a.created_at >= debutSemaine).reduce((s,a)=>s+Number(a.montant),0);
   document.getElementById('week-reappro').textContent = reapproSemaine.toLocaleString('fr-FR')+' FCFA';
   document.getElementById('ra-semaine').textContent = reapproSemaine.toLocaleString('fr-FR')+' FCFA';
 
@@ -404,8 +537,12 @@ async function loadDashboard(){
 let historiqueCache = [];
 async function loadHistorique(){
   document.getElementById('hi-list').innerHTML = 'Chargement…';
-  const { data } = await sb.from('transactions').select('montant, type, created_at, clients(nom)').order('created_at',{ascending:false}).limit(300);
-  historiqueCache = data || [];
+  const [txs, clientsAll] = await Promise.all([idbGetAll('transactions'), idbGetAll('clients')]);
+  const clientById = Object.fromEntries(clientsAll.map(c=>[c.id, c]));
+  historiqueCache = txs
+    .map(t => ({ ...t, clients: clientById[t.client_id] ? { nom: clientById[t.client_id].nom } : null }))
+    .sort((a,b)=> new Date(b.created_at) - new Date(a.created_at))
+    .slice(0,300);
   renderHistorique(historiqueCache);
 }
 function typeLabel(t){ return t==='depot'?'Dépôt':t==='retrait'?'Retrait':t==='credit_appel'?'Crédit appel':'Crédit internet'; }
@@ -444,12 +581,8 @@ function exportCSV(){
   downloadFile('ssri_transactions_'+todayStr()+'.csv', csv, 'text/csv');
 }
 async function exportBackup(){
-  const tables = ['clients','transactions','dettes','approvisionnements','objectifs','soldes','parametres'];
   const backup = {};
-  for (const t of tables){
-    const { data } = await sb.from(t).select('*');
-    backup[t] = data || [];
-  }
+  for (const t of Object.keys(STORES)){ backup[t] = await idbGetAll(t); }
   downloadFile('ssri_sauvegarde_'+todayStr()+'.json', JSON.stringify(backup, null, 2), 'application/json');
 }
 
@@ -460,15 +593,22 @@ function renderDetteRow(d){
     <div class="row-amount ${d.sens==='client_me_doit'?'':'owed'}">${d.sens==='client_me_doit'?'+':'−'} ${Number(d.montant).toLocaleString('fr-FR')} FCFA</div></div>`;
 }
 async function loadDettes(){
-  const { data } = await sb.from('dettes').select('id, montant, sens, echeance, clients(nom)').eq('reglee', false).order('created_at',{ascending:false});
-  const list = data || [];
+  const [dettesAll, clientsAll] = await Promise.all([idbGetAll('dettes'), idbGetAll('clients')]);
+  const clientById = Object.fromEntries(clientsAll.map(c=>[c.id, c]));
+  const list = dettesAll
+    .filter(d => !d.reglee)
+    .map(d => ({ ...d, clients: clientById[d.client_id] ? { nom: clientById[d.client_id].nom } : null }))
+    .sort((a,b)=> new Date(b.created_at||0) - new Date(a.created_at||0));
   document.getElementById('dettes-preview').innerHTML = list.length ? list.slice(0,2).map(renderDetteRow).join('') : `<div class="row"><div class="row-name">Aucune dette</div></div>`;
   document.getElementById('dettes-list').innerHTML = list.length ? list.map(renderDetteRow).join('') : `<div class="row"><div class="row-name">Aucune dette</div></div>`;
 }
 async function resolveDette(id, nom, montant){
   const ok = confirm(nom+' — '+Number(montant).toLocaleString('fr-FR')+' FCFA\n\nMarquer cette dette comme réglée (elle disparaîtra de la liste) ?');
   if (!ok) return;
-  await sb.from('dettes').update({ reglee: true }).eq('id', id);
+  const dette = await idbGet('dettes', id);
+  if (dette){ dette.reglee = true; await idbPut('dettes', dette); }
+  await queueMutation('dettes','update', { reglee:true }, { id });
+  if (isOnline()) flushQueue();
   await loadDettes();
 }
 
@@ -481,8 +621,7 @@ function renderClients(list){
 }
 let clientsCache = [];
 async function loadClients(){
-  const { data } = await sb.from('clients').select('id, nom, cumul_transactions, categorie').order('cumul_transactions',{ascending:false});
-  clientsCache = data || [];
+  clientsCache = (await idbGetAll('clients')).sort((a,b)=> (b.cumul_transactions||0)-(a.cumul_transactions||0));
   renderClients(clientsCache);
 }
 
@@ -496,8 +635,8 @@ async function openClient(id){
   document.getElementById('cm-total').textContent = (Number(c?.cumul_transactions)||0).toLocaleString('fr-FR')+' FCFA';
   document.getElementById('cm-history').innerHTML = 'Chargement…';
 
-  const { data } = await sb.from('transactions').select('montant, type, created_at').eq('client_id', id).order('created_at',{ascending:false});
-  const txs = data || [];
+  const allTx = await idbGetAll('transactions');
+  const txs = allTx.filter(t=>t.client_id===id).sort((a,b)=> new Date(b.created_at)-new Date(a.created_at));
   const groups = {};
   txs.forEach(t=>{
     const d = new Date(t.created_at);
@@ -564,7 +703,9 @@ function closeClientModal(){
 async function confirmRemoveClient(){
   const ok = confirm('Supprimer '+currentClientNom+' ?\n\n(Utile en cas de doublon créé par erreur. Son historique de transactions passées est conservé mais ne sera plus lié à un nom.)');
   if (!ok) return;
-  await sb.from('clients').delete().eq('id', currentClientId);
+  await idbDelete('clients', currentClientId);
+  await queueMutation('clients','delete', null, { id: currentClientId });
+  if (isOnline()) flushQueue();
   closeClientModal();
   await loadClients();
 }
@@ -574,12 +715,14 @@ document.getElementById('cl-search').addEventListener('input', e=>{
 });
 
 async function upsertClient(nom){
-  let { data } = await sb.from('clients').select('*').ilike('nom', nom).maybeSingle();
-  if (!data){
-    const { data: created } = await sb.from('clients').insert({ nom }).select().single();
-    data = created;
-  }
-  return data;
+  const all = await idbGetAll('clients');
+  let client = all.find(c => c.nom.toLowerCase() === nom.toLowerCase());
+  if (client) return client;
+  client = { id: crypto.randomUUID(), nom, cumul_transactions: 0, categorie: 'nouveau' };
+  await idbPut('clients', client);
+  await queueMutation('clients','upsert', client, 'id');
+  if (isOnline()) flushQueue();
+  return client;
 }
 
 /* ---------- Transaction ---------- */
@@ -588,8 +731,9 @@ const txBox = document.getElementById('tx-suggestions');
 txInput.addEventListener('input', async ()=>{
   const q = txInput.value.trim().toLowerCase(); txBox.innerHTML = '';
   if(!q) return;
-  const { data } = await sb.from('clients').select('nom').ilike('nom', '%'+q+'%').limit(5);
-  (data||[]).forEach(c=>{
+  const all = await idbGetAll('clients');
+  const matches = all.filter(c=>c.nom.toLowerCase().includes(q)).slice(0,5);
+  matches.forEach(c=>{
     const chip = document.createElement('div'); chip.className='chip'; chip.textContent=c.nom;
     chip.onclick = ()=>{ txInput.value=c.nom; txBox.innerHTML=''; };
     txBox.appendChild(chip);
@@ -622,16 +766,21 @@ async function saveTransaction(){
   }
 
   const client = await upsertClient(nom);
-  await sb.from('transactions').insert({ client_id: client.id, type: txType, montant, operateur: 'airtel' });
+  const tx = { id: crypto.randomUUID(), client_id: client.id, type: txType, montant, operateur: 'airtel', created_at: new Date().toISOString() };
+  await idbPut('transactions', tx);
+  await queueMutation('transactions','upsert', tx, 'id');
 
   const cumulAvant = Number(client.cumul_transactions)||0;
   const cumulApres = cumulAvant + montant;
   const catAvant = client.categorie;
   const catApres = computeCategorie(cumulApres);
-  await sb.from('clients').update({ cumul_transactions: cumulApres, categorie: catApres }).eq('id', client.id);
+  const updatedClient = { ...client, cumul_transactions: cumulApres, categorie: catApres };
+  await idbPut('clients', updatedClient);
+  await queueMutation('clients','upsert', updatedClient, 'id');
 
   const delta = typeChoisi === 'retrait' ? montant : -montant;
   await updateSolde('airtel', delta);
+  if (isOnline()) flushQueue();
 
   txInput.value=''; document.getElementById('tx-montant').value=''; txBox.innerHTML='';
 
@@ -656,7 +805,10 @@ async function saveDette(){
   const sens = document.querySelector('#sens-switch .sens-opt.active')?.dataset.v;
   if (!nom || !montant || montant<=0 || !echeance) { alert('Remplis tous les champs'); return; }
   const client = await upsertClient(nom);
-  await sb.from('dettes').insert({ client_id: client.id, montant, sens, echeance });
+  const dette = { id: crypto.randomUUID(), client_id: client.id, montant, sens, echeance, reglee:false, created_at: new Date().toISOString() };
+  await idbPut('dettes', dette);
+  await queueMutation('dettes','upsert', dette, 'id');
+  if (isOnline()) flushQueue();
   document.getElementById('dt-client').value='';
   document.getElementById('dt-montant').value='';
   document.getElementById('dt-echeance').value='';
@@ -671,8 +823,11 @@ async function saveReappro(){
   try{
   const montant = parseFloat(document.getElementById('ra-montant').value);
   if (!montant || montant<=0) { alert('Entre un montant valide'); return; }
-  await sb.from('approvisionnements').insert({ montant, operateur: 'airtel' });
+  const appro = { id: crypto.randomUUID(), montant, operateur: 'airtel', created_at: new Date().toISOString() };
+  await idbPut('approvisionnements', appro);
+  await queueMutation('approvisionnements','upsert', appro, 'id');
   await updateSolde('airtel', montant);
+  if (isOnline()) flushQueue();
   document.getElementById('ra-montant').value='';
   await loadDashboard();
   goTo('accueil');
@@ -680,14 +835,40 @@ async function saveReappro(){
 }
 
 /* ---------- Démarrage ---------- */
-loadParametres();
-loadDashboard();
-loadClients();
+(async function init(){
+  await openDB();
+  await loadParametres();
+  if (isOnline()){
+    await flushQueue();
+    await pullAll();
+    await loadParametres();
+  }
+  await loadDashboard();
+  await loadClients();
+  updateSyncBadge();
+})();
+
 if ('serviceWorker' in navigator) {
   const swSource = `
+    const CACHE_NAME = 'ssri-cache-v1';
     self.addEventListener('install', e => { self.skipWaiting(); });
     self.addEventListener('activate', e => { self.clients.claim(); });
-    self.addEventListener('fetch', e => { e.respondWith(fetch(e.request).catch(()=>caches.match(e.request))); });
+    self.addEventListener('fetch', e => {
+      if (e.request.method !== 'GET') return;
+      e.respondWith(
+        caches.open(CACHE_NAME).then(async cache => {
+          try {
+            const fresh = await fetch(e.request);
+            if (fresh && fresh.status === 200) cache.put(e.request, fresh.clone());
+            return fresh;
+          } catch (err) {
+            const cached = await cache.match(e.request);
+            if (cached) return cached;
+            throw err;
+          }
+        })
+      );
+    });
   `;
   const swBlob = new Blob([swSource], { type: 'text/javascript' });
   navigator.serviceWorker.register(URL.createObjectURL(swBlob)).catch(()=>{});
